@@ -1,0 +1,161 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+# e2e boots OPNsense under KVM in containerlab, from the nano image
+# downloaded from OPNsense and built on the runner with vrnetlab. Nothing is
+# pushed or uploaded.
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Conn3x
+        env: &gh
+          GH_TOKEN: ${{ github.token }}
+        run: &install |
+          tag=$(gh release view -R conn3xorg/conn3x --json tagName -q .tagName)
+          file="conn3x_${tag#v}_linux_amd64.tar.gz"
+          cd "$RUNNER_TEMP"
+          curl -sSfLO "https://github.com/conn3xorg/conn3x/releases/download/$tag/$file"
+          curl -sSfLO "https://github.com/conn3xorg/conn3x/releases/download/$tag/checksums.txt"
+          grep " $file\$" checksums.txt | sha256sum -c -
+          mkdir -p bin && tar -xzf "$file" -C bin conn3x
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - run: conn3x version
+      - run: conn3x fmt -check -recursive
+      - name: Validate
+        run: conn3x init -backend=false && conn3x validate
+      - name: Validate the example
+        working-directory: examples/local
+        run: conn3x init -backend=false && conn3x validate
+
+  e2e:
+    needs: validate
+    runs-on: ubuntu-24.04
+    name: e2e (opnsense-26.7)
+    timeout-minutes: 40
+    env:
+      CLAB_VERSION: 0.82.0
+      CLAB_SHA256: 770e18f19ef75732eb9f4e362541f509abb2b6eeadde2d5c98140190b19b519a
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Conn3x
+        env: *gh
+        run: *install
+      # Hosted Ubuntu runners have KVM, but /dev/kvm isn't open to the
+      # runner user until a udev rule says so. The image build copies the
+      # whole 8 GB disk, more than the runner has free, so the preinstalled
+      # SDKs go first.
+      - name: Open up KVM, free disk space, install containerlab
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          cd "$RUNNER_TEMP"
+          deb="containerlab_${CLAB_VERSION}_linux_amd64.deb"
+          curl -sSfLO "https://github.com/srl-labs/containerlab/releases/download/v${CLAB_VERSION}/$deb"
+          echo "$CLAB_SHA256  $deb" | sha256sum -c -
+          sudo apt-get update -q
+          sudo apt-get install -y -q "./$deb" qemu-utils sshpass
+      - name: Start the lab firewall
+        working-directory: examples/local
+        run: ./up.sh
+      # Apply with the provider release before the pinned one first, then
+      # move to the pin, as anyone upgrading this circuit does.
+      - name: Apply with the previous provider release, 0.25.0
+        working-directory: examples/local
+        run: |
+          sed -i 's/version = "0.26.0"/version = "0.25.0"/' ../../versions.tf
+          conn3x init
+          conn3x apply -auto-approve
+      - name: Upgrade to the pinned provider, apply, then plan again with no changes
+        working-directory: examples/local
+        run: |
+          git checkout -- ../../versions.tf
+          conn3x init -upgrade
+          conn3x apply -auto-approve
+          conn3x plan -detailed-exitcode
+      # What the README's readers do in the GUI between the two applies.
+      - name: Assign the VLANs to interfaces
+        working-directory: examples/local
+        run: |
+          ./assign.sh
+          echo "TF_VAR_assigned=true" >> "$GITHUB_ENV"
+      - name: Apply the rules and DHCP, then plan again with no changes
+        working-directory: examples/local
+        run: |
+          conn3x apply -auto-approve
+          conn3x plan -detailed-exitcode
+      - name: Use the VLANs from the client
+        working-directory: examples/local
+        run: ./check.sh
+      - name: Check the API secret stayed out of state
+        working-directory: examples/local
+        run: |
+          secret=$(sed -n 's/^api_secret *= "\(.*\)"$/\1/p' lab.auto.tfvars)
+          [ -n "$secret" ]
+          if grep -qF "$secret" terraform.tfstate; then echo "The API secret is in the state." >&2; exit 1; fi
+      - name: Change a rule by hand, and see drift
+        working-directory: examples/local
+        run: |
+          val() { sed -n "s/^$1 *= \"\(.*\)\"$/\1/p" lab.auto.tfvars; }
+          uuid=$(conn3x show -json | jq -r '.values.root_module.child_modules[].resources[] | select(.address == "module.vlans.opnsense_firewall_filter.trusted[\"trusted\"]") | .values.id')
+          [ -n "$uuid" ]
+          printf 'user = "%s:%s"\n' "$(val api_key)" "$(val api_secret)" |
+            curl -ksSf -K - -H 'Content-Type: application/json' -d '{"rule":{"description":"changed by hand"}}' "$(val uri)/api/firewall/filter/set_rule/$uuid"
+          rc=0
+          conn3x drift || rc=$?
+          [ "$rc" -eq 2 ] || { echo "drift exited $rc, not 2." >&2; exit 1; }
+      - name: Apply again, then plan with no changes
+        working-directory: examples/local
+        run: |
+          conn3x apply -auto-approve
+          conn3x plan -detailed-exitcode
+      - name: Reboot the firewall
+        working-directory: examples/local
+        run: |
+          val() { sed -n "s/^$1 *= \"\(.*\)\"$/\1/p" lab.auto.tfvars; }
+          ip=$(val uri); ip=${ip#https://}
+          fw() { sshpass -p opnsense ssh -q -o ConnectTimeout=5 -o UserKnownHostsFile=known_hosts "root@$ip" "$@"; }
+          before=$(fw sysctl -n kern.boottime)
+          fw 'shutdown -r now' || true
+          # Back means a new boot time and the GUI answering.
+          for i in $(seq 100); do
+            sleep 5
+            now=$(fw sysctl -n kern.boottime 2>/dev/null) || now=$before
+            [ "$now" != "$before" ] && curl -ksf -o /dev/null -m 5 "https://$ip/" && break
+            [ "$i" -lt 100 ] || { echo "The firewall didn't come back after the reboot." >&2; exit 1; }
+          done
+          echo "Booted again: $now"
+      - name: Use the VLANs again after the reboot
+        working-directory: examples/local
+        run: ./check.sh
+      - name: Plan again after the reboot, with no changes
+        working-directory: examples/local
+        run: conn3x plan -detailed-exitcode
+      - name: Show the firewall's console, interfaces, DHCP and rules
+        if: failure()
+        working-directory: examples/local
+        run: |
+          docker logs --tail 60 clab-opnsense-fw || true
+          ip=$(sed -n 's/^uri *= "https:\/\/\(.*\)"$/\1/p' lab.auto.tfvars)
+          sshpass -p opnsense ssh -q -o UserKnownHostsFile=known_hosts "root@$ip" \
+            'ifconfig vtnet2; ifconfig vlan0.10; ifconfig vlan0.20; grep -A9 "<opt1>" /conf/config.xml; head -c 3000 /usr/local/etc/kea/kea-dhcp4.conf; echo; sockstat -4l | grep -E ":(53|67) "; pfctl -sr | grep -E "vlan0|10\.(10|20|30)\." | head -30; tail -n 30 /var/log/kea/latest.log' || true
+          docker exec clab-opnsense-c1 sh -c 'ip -d link show eth1.10; ip addr add 10.10.0.50/24 dev eth1.10; ping -c 2 -W 2 10.10.0.1; udhcpc -i eth1.10 -n -q -t 3 -v' || true
+      - name: Clean up
+        if: always()
+        working-directory: examples/local
+        run: ./down.sh

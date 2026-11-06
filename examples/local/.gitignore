@@ -1,0 +1,7 @@
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate*
+lab.clab.yml
+lab.auto.tfvars
+clab-*/
+known_hosts
