@@ -18,14 +18,6 @@ resource "opnsense_interfaces_vlan" "this" {
   description = coalesce(each.value.description, each.key)
 }
 
-resource "opnsense_firewall_alias" "private" {
-  count       = length(local.restricted) > 0 ? 1 : 0
-  name        = "private_networks"
-  type        = "network"
-  content     = var.private_networks
-  description = "Networks internet_only VLANs can't reach"
-}
-
 # trusted: anything from the VLAN's network.
 resource "opnsense_firewall_filter" "trusted" {
   for_each    = { for name, v in local.assigned : name => v if v.policy == "trusted" }
@@ -41,8 +33,8 @@ resource "opnsense_firewall_filter" "trusted" {
   }
 }
 
-# internet_only, in sequence: DNS to the firewall, nothing to private
-# networks (the firewall's own addresses included), then anything else.
+# internet_only, in sequence: DNS to the firewall, nothing to the firewall
+# itself or to private networks, then anything else.
 resource "opnsense_firewall_filter" "dns" {
   for_each    = local.restricted
   sequence    = each.value.seq
@@ -58,10 +50,16 @@ resource "opnsense_firewall_filter" "dns" {
   }
 }
 
+# One rule per destination, with the network written into the rule. An
+# alias would be a pf table that OPNsense fills after loading the rules, and
+# it can skip filling it, which left the table empty and the pass rule below
+# open to everything, the GUI included. OPNsense won't take a list of
+# networks in one rule, only aliases and (self).
 resource "opnsense_firewall_filter" "block_private" {
-  for_each    = local.restricted
+  for_each = { for p in setproduct(keys(local.restricted), concat(["(self)"], var.private_networks)) : "${p[0]} ${p[1]}" => merge(local.restricted[p[0]], { vlan = p[0], dest = p[1] }) }
+
   sequence    = each.value.seq + 1
-  description = "${each.key}: block private networks"
+  description = "${each.value.vlan}: block ${each.value.dest == "(self)" ? "the firewall" : each.value.dest}"
   interface   = { interface = [each.value.interface] }
   filter = {
     quick       = true
@@ -69,7 +67,7 @@ resource "opnsense_firewall_filter" "block_private" {
     direction   = "in"
     protocol    = "any"
     source      = { net = each.value.network }
-    destination = { net = opnsense_firewall_alias.private[0].name }
+    destination = { net = each.value.dest }
   }
 }
 
