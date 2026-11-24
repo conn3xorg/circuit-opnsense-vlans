@@ -36,7 +36,7 @@ provider "opnsense" {
 }
 
 module "vlans" {
-  source = "github.com/conn3xorg/circuit-opnsense-vlans?ref=v0.1.0"
+  source = "github.com/conn3xorg/circuit-opnsense-vlans?ref=v0.2.0"
 
   vlans = {
     trusted = {
