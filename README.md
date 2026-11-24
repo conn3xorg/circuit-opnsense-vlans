@@ -88,11 +88,13 @@ After that it's one apply per change. Adding a VLAN later means the same four st
 1. Creates each VLAN on its parent interface, as device `vlan0.<tag>` unless you set `device`.
 2. For each VLAN with `interface` set, adds firewall rules on that interface, by `policy`:
    - `trusted` (the default): anything from the VLAN's network.
-   - `internet_only`: DNS (TCP and UDP 53) to the firewall's address on the VLAN, then a block on everything in `private_networks`, then anything else. That alias holds RFC 1918, CGNAT and link-local ranges by default, so the firewall's other addresses are blocked too.
+   - `internet_only`: DNS (TCP and UDP 53) to the firewall's address on the VLAN, then a block on the firewall itself (every address it has, WAN included) and everything in `private_networks`, then anything else. `private_networks` holds RFC 1918, CGNAT and link-local ranges by default. Each one gets its own block rule with the network written in, not a firewall alias, so the block is there the moment the rules load. (OPNsense fills an alias after loading the rules, and in v0.1.0 an alias left empty let these VLANs reach the GUI.)
 3. For each VLAN with `interface` and `dhcp` set, adds a Kea DHCPv4 subnet for the VLAN's network with your pools, the firewall's address as router and DNS server, and an optional domain name.
 4. Adds an Unbound host override for each name in `host_overrides`.
 
 The rules start at sequence 10000 (`rule_sequence`), ten apart per VLAN in name order, so they stay clear of rules you add by hand lower down.
+
+Upgrading from v0.1.0 deletes the `private_networks` alias and swaps each VLAN's single block rule for the per-network ones. For the few seconds that apply takes, an `internet_only` VLAN can be open to private networks, so run it when that doesn't matter.
 
 It doesn't do NAT, WAN settings, outbound rules, VPNs, or DHCP reservations. The provider has resources for several of those (WireGuard, IPsec, port forwards, Kea reservations), and they sit fine next to this circuit.
 
