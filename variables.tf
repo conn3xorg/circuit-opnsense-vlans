@@ -55,7 +55,7 @@ variable "host_overrides" {
 variable "private_networks" {
   type        = list(string)
   default     = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16"]
-  description = "Networks an internet_only VLAN can't reach. They go in a firewall alias named private_networks."
+  description = "Networks an internet_only VLAN can't reach, besides the firewall itself. Each gets its own block rule."
 }
 
 variable "rule_sequence" {
